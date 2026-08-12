@@ -1,0 +1,51 @@
+services:
+  node-server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    environment:
+      REACT_APP_MONGODB_URI: mongodb://mongo-server:27017/shorturl
+    volumes:
+      - /app/node_modules
+      - ./server:/app
+    depends_on:
+      - mongo-server
+      - redis-server
+      - zookeeper-server
+    ports:
+      - '8081'
+    expose:
+      - '8081'
+    restart: always
+
+  client-server:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+    volumes:
+      - /app/node_modules
+      - ./client:/app
+    ports:
+      - '3000:3000'
+    restart: always
+
+  redis-server:
+    image: redis
+    restart: always
+
+  zookeeper-server:
+    image: zookeeper
+    restart: always
+
+  mongo-server:
+    image: mongo
+    restart: always
+
+  nginx:
+    image: nginx
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+    depends_on:
+      - node-server
+    ports:
+      - '4000:80'
