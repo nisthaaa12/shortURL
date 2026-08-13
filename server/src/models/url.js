@@ -8,7 +8,8 @@ const URL = mongoose.Schema({
     },
     OriginalUrl: {
         type: String,
-        required: true
+        required: true,
+        unique: true
     },
     Visits: {
         type: Number,
