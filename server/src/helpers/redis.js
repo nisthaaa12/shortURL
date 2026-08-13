@@ -2,40 +2,8 @@ require('dotenv').config()
 const redis = require('redis')
 const ShortURL = require('../models/url')
 
-class Queue {
-    constructor() {
-        this.items = []
-    }
+const VISITS_HASH_KEY = 'url_visits'
 
-    enqueue = async (element) => {
-        if (this.size() < 10) {
-            this.items.push(element)
-        } else {
-            while (!this.isEmpty()) {
-                await ShortURL.findOneAndUpdate({ Hash: this.dequeue() }, { $inc: { Visits: 1 } })
-                    .catch(err => console.log(err))
-            }
-        }
-    }
-
-    dequeue() {
-        return this.items.shift()
-    }
-
-    isEmpty() {
-        return this.items.length === 0
-    }
-
-    size() {
-        return this.items.length
-    }
-
-    print() {
-        console.log(this.items.toString())
-    }
-}
-
-let jobQueue = new Queue()
 let redisClient = null
 
 const connectRedis = async () => {
@@ -56,4 +24,92 @@ const connectRedis = async () => {
     return redisClient
 }
 
-module.exports = { jobQueue, connectRedis }
+const isRedisConnected = () => {
+    return Boolean(redisClient && redisClient.connected)
+}
+
+const recordVisit = async (hash) => {
+    try {
+        const client = await connectRedis()
+
+        return new Promise((resolve) => {
+            client.hincrby(VISITS_HASH_KEY, hash, 1, (err) => {
+                if (err) {
+                    console.log(err)
+                }
+
+                resolve()
+            })
+        })
+    } catch (err) {
+        console.log(err)
+    }
+}
+
+const flushVisitsToMongo = async () => {
+    try {
+        const client = await connectRedis()
+
+        const visits = await new Promise((resolve, reject) => {
+            client.hgetall(VISITS_HASH_KEY, (err, result) => {
+                if (err) {
+                    return reject(err)
+                }
+
+                resolve(result || {})
+            })
+        })
+
+        const hashes = Object.keys(visits)
+
+        if (!hashes.length) {
+            return
+        }
+
+        for (const hash of hashes) {
+            const count = parseInt(visits[hash], 10)
+
+            if (!count || count <= 0) {
+                continue
+            }
+
+            const removed = await new Promise((resolve) => {
+                client.hdel(VISITS_HASH_KEY, hash, (err, reply) => {
+                    if (err) {
+                        console.log(err)
+                        return resolve(0)
+                    }
+
+                    resolve(reply)
+                })
+            })
+
+            if (!removed) {
+                continue
+            }
+
+            await ShortURL.findOneAndUpdate(
+                { Hash: hash },
+                { $inc: { Visits: count } }
+            ).catch((err) => console.log(err))
+        }
+
+        console.log(`Flushed visit counts for ${hashes.length} URL(s) to MongoDB.`)
+    } catch (err) {
+        console.log(err)
+    }
+}
+
+const startVisitFlushWorker = (intervalMs = 30000) => {
+    setInterval(() => {
+        flushVisitsToMongo()
+    }, intervalMs)
+}
+
+module.exports = {
+    connectRedis,
+    isRedisConnected,
+    recordVisit,
+    flushVisitsToMongo,
+    startVisitFlushWorker
+}
