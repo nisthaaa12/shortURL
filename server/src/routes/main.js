@@ -1,6 +1,7 @@
 require('dotenv').config()
 const express = require('express')
-const { urlPost, urlGet, tokenDelete } = require('../controllers/zkController')
+const { urlPost, urlGet } = require('../controllers/zkController')
+const { getHealth, getReadiness } = require('../controllers/healthController')
 const rateLimiter = require('../middleware/rateLimiter')
 
 const router = express.Router()
@@ -17,8 +18,9 @@ const redirectLimiter = rateLimiter({
     windowSeconds: Number(process.env.URL_REDIRECT_RATE_LIMIT_WINDOW_SECONDS) || 60
 })
 
+router.get('/health', getHealth)
+router.get('/ready', getReadiness)
 router.post('/url', createUrlLimiter, urlPost)
 router.get('/url/:identifier', redirectLimiter, urlGet)
-router.get('/del', tokenDelete)
 
 module.exports = router
