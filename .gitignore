@@ -128,3 +128,6 @@ dist
 .yarn/build-state.yml
 .yarn/install-state.gz
 .pnp.*
+
+# Private study guide (not part of the repo)
+SHORTURL_COMPLETE_TECHNICAL_GUIDE.md
