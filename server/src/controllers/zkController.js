@@ -1,10 +1,40 @@
 const ShortURL = require('../models/url')
-const { connectRedis, jobQueue } = require('../helpers/redis')
-const { range, hashGenerator, getTokenRange, removeToken } = require('../helpers/zookeeper')
+const { connectRedis, recordVisit } = require('../helpers/redis')
+const { validateOriginalUrl } = require('../helpers/validateUrl')
+const { hashGenerator, allocateTokenId } = require('../helpers/zookeeper')
 
 const DEFAULT_EXPIRATION_DAYS = Number(process.env.URL_EXPIRATION_DAYS) || 365
 const MAX_EXPIRATION_DAYS = Number(process.env.URL_MAX_EXPIRATION_DAYS) || 365
 const CACHE_TTL_SECONDS = 600
+const REDIRECT_CACHE_PREFIX = 'redirect:'
+
+const getRedirectCacheKey = (hash) => `${REDIRECT_CACHE_PREFIX}${hash}`
+
+const getCacheTtlSeconds = (expiresAt) => {
+    if (!expiresAt) {
+        return CACHE_TTL_SECONDS
+    }
+
+    const secondsUntilExpiry = Math.floor((new Date(expiresAt).getTime() - Date.now()) / 1000)
+    if (secondsUntilExpiry <= 0) {
+        return 0
+    }
+
+    return Math.min(CACHE_TTL_SECONDS, secondsUntilExpiry)
+}
+
+const cacheRedirect = (redisClient, hash, originalUrl, expiresAt) => {
+    const ttl = getCacheTtlSeconds(expiresAt)
+    if (ttl <= 0) {
+        return
+    }
+
+    redisClient.setex(getRedirectCacheKey(hash), ttl, originalUrl)
+}
+
+const invalidateRedirectCache = (redisClient, hash) => {
+    redisClient.del(getRedirectCacheKey(hash))
+}
 
 const getExpirationDate = (expirationDays) => {
     const parsedDays = Number(expirationDays)
@@ -18,37 +48,52 @@ const isExpired = (url) => {
     return url.ExpiresAt && url.ExpiresAt.getTime() <= Date.now()
 }
 
-let urlPost = async (req, res) => {
-    const originalUrl = req.body.OriginalUrl
+const returnExistingHash = (res, redisClient, url) => {
+    redisClient.setex(url.OriginalUrl, CACHE_TTL_SECONDS, url.Hash)
+    cacheRedirect(redisClient, url.Hash, url.OriginalUrl, url.ExpiresAt)
+    return res.json(url.Hash)
+}
 
-    if (!originalUrl) {
-        return res.status(400).json({ error: 'OriginalUrl is required.' })
+let urlPost = async (req, res) => {
+    const validation = validateOriginalUrl(req.body.OriginalUrl)
+
+    if (!validation.valid) {
+        return res.status(400).json({ error: validation.error })
     }
+
+    const originalUrl = validation.normalizedUrl
 
     let redisClient = await connectRedis()
 
     const createShortUrl = async () => {
-        if (range.curr < range.end - 1 && range.curr != 0) {
-            range.curr++
-        } else {
-            await getTokenRange()
-            range.curr++
-        }
+        try {
+            const tokenId = await allocateTokenId()
+            const url = await ShortURL.create({
+                Hash: hashGenerator(tokenId),
+                OriginalUrl: originalUrl,
+                Visits: 0,
+                CreatedAt: new Date(),
+                ExpiresAt: getExpirationDate(req.body.ExpirationDays)
+            })
 
-        ShortURL.create({
-            Hash: hashGenerator(range.curr - 1),
-            OriginalUrl: originalUrl,
-            Visits: 0,
-            CreatedAt: new Date(),
-            ExpiresAt: getExpirationDate(req.body.ExpirationDays)
-        }, (err, url) => {
-            if (err) {
-                console.log(err)
-                return res.status(500).json({ error: 'Could not shorten URL.' })
-            }
             res.json(url.Hash)
             redisClient.setex(originalUrl, CACHE_TTL_SECONDS, url.Hash)
-        })
+            cacheRedirect(redisClient, url.Hash, url.OriginalUrl, url.ExpiresAt)
+        } catch (err) {
+            if (err.code === 11000) {
+                const existing = await ShortURL.findOne({ OriginalUrl: originalUrl }).catch(() => null)
+
+                if (!existing || isExpired(existing)) {
+                    console.log(err)
+                    return res.status(500).json({ error: 'Could not shorten URL.' })
+                }
+
+                return returnExistingHash(res, redisClient, existing)
+            }
+
+            console.log(err)
+            return res.status(500).json({ error: 'Could not shorten URL.' })
+        }
     }
 
     redisClient.get(originalUrl, async (err, response) => {
@@ -61,6 +106,7 @@ let urlPost = async (req, res) => {
             })
 
             if (cachedUrl && !isExpired(cachedUrl)) {
+                cacheRedirect(redisClient, response, cachedUrl.OriginalUrl, cachedUrl.ExpiresAt)
                 return res.json(response)
             }
         }
@@ -75,8 +121,7 @@ let urlPost = async (req, res) => {
                 if (isExpired(url)) {
                     await ShortURL.findByIdAndDelete(url._id)
                 } else {
-                    redisClient.setex(url.OriginalUrl, CACHE_TTL_SECONDS, url.Hash)
-                    return res.json(url.Hash)
+                    return returnExistingHash(res, redisClient, url)
                 }
             }
 
@@ -86,28 +131,49 @@ let urlPost = async (req, res) => {
 }
 
 let urlGet = async (req, res) => {
-    ShortURL.findOne({ Hash: req.params.identifier }, async (err, url) => {
+    const hash = req.params.identifier
+    const redisClient = await connectRedis()
+
+    const serveRedirect = (originalUrl) => {
+        res.redirect(originalUrl)
+        recordVisit(hash)
+    }
+
+    const serveExpired = async (urlId) => {
+        invalidateRedirectCache(redisClient, hash)
+        if (urlId) {
+            await ShortURL.findByIdAndDelete(urlId).catch(err => console.log(err))
+        } else {
+            await ShortURL.findOneAndDelete({ Hash: hash }).catch(err => console.log(err))
+        }
+        return res.status(410).send('URL has expired')
+    }
+
+    redisClient.get(getRedirectCacheKey(hash), async (err, cachedOriginalUrl) => {
         if (err) {
             console.log(err)
-            return res.status(500).send('Something went wrong')
+        } else if (cachedOriginalUrl) {
+            return serveRedirect(cachedOriginalUrl)
         }
-        if (url) {
-            if (isExpired(url)) {
-                await ShortURL.findByIdAndDelete(url._id)
-                return res.status(410).send('URL has expired')
+
+        ShortURL.findOne({ Hash: hash }, async (findErr, url) => {
+            if (findErr) {
+                console.log(findErr)
+                return res.status(500).send('Something went wrong')
             }
 
-            res.redirect(url.OriginalUrl)
-            jobQueue.enqueue(url.Hash)
-        } else {
-            res.status(404).send('URL not found')
-        }
+            if (!url) {
+                return res.status(404).send('URL not found')
+            }
+
+            if (isExpired(url)) {
+                return serveExpired(url._id)
+            }
+
+            cacheRedirect(redisClient, hash, url.OriginalUrl, url.ExpiresAt)
+            return serveRedirect(url.OriginalUrl)
+        })
     })
 }
 
-let tokenDelete = async (req, res) => {
-    removeToken()
-    res.send('Token deleted')
-}
-
-module.exports = { urlPost, urlGet, tokenDelete }
+module.exports = { urlPost, urlGet }
